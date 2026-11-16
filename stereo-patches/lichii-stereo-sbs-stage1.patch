@@ -1,0 +1,174 @@
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+index a2e57f9..397daa3 100644
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -51,6 +51,7 @@ SWITCHABLE(NvidiaDlssQuality, false);
+ SWITCHABLE(NvidiaDlssPreset, false);
+ SWITCHABLE(HdrMode, false);
+ SWITCHABLE(HdrSwapchain, false);
++SWITCHABLE(StereoMode, false);
+ SWITCHABLE(AspectRatio, true);
+ SWITCHABLE(AstcDecodeMode, true);
+ SWITCHABLE(AstcRecompression, true);
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 76d503d..328dddc 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -68,6 +68,7 @@ SWITCHABLE(NvidiaDlssQuality, false);
+ SWITCHABLE(NvidiaDlssPreset, false);
+ SWITCHABLE(HdrMode, false);
+ SWITCHABLE(HdrSwapchain, false);
++SWITCHABLE(StereoMode, false);
+ SWITCHABLE(AspectRatio, true);
+ SWITCHABLE(AstcDecodeMode, true);
+ SWITCHABLE(AstcRecompression, true);
+@@ -388,6 +389,38 @@ struct Values {
+                                            true,
+                                            true};
+ 
++    // Stereoscopic 3D output. SideBySide is half-width side-by-side (each eye squeezed to half the
++    // window width), the format 3D TVs, 3D monitors and VR virtual screens expect.
++    SwitchableSetting<StereoMode> stereo_mode{linkage,
++                                              StereoMode::Off,
++                                              "stereo_mode",
++                                              Category::Renderer,
++                                              Specialization::Default,
++                                              true,
++                                              true};
++    SwitchableSetting<int, true> stereo_depth{linkage,
++                                              100,
++                                              0,
++                                              300,
++                                              "stereo_depth",
++                                              Category::Renderer,
++                                              Specialization::Scalar | Specialization::Percentage,
++                                              true,
++                                              true};
++    SwitchableSetting<int, true> stereo_convergence{linkage,
++                                                    50,
++                                                    0,
++                                                    100,
++                                                    "stereo_convergence",
++                                                    Category::Renderer,
++                                                    Specialization::Scalar |
++                                                        Specialization::Percentage,
++                                                    true,
++                                                    true};
++    SwitchableSetting<bool> stereo_swap_eyes{linkage, false, "stereo_swap_eyes",
++                                             Category::Renderer, Specialization::Default, true,
++                                             true};
++
+     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
+                                                     ScalingFilter::ScaleForce,
+                                                     "scaling_filter",
+diff --git a/src/common/settings_enums.h b/src/common/settings_enums.h
+index 8136707..0c042b1 100644
+--- a/src/common/settings_enums.h
++++ b/src/common/settings_enums.h
+@@ -150,6 +150,7 @@ ENUM(NvdecEmulation, Off, Cpu, Gpu);
+ ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X, Res3X, Res4X, Res5X, Res6X, Res7X, Res8X);
+ ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3);
+ ENUM(AntiAliasing, None, Fxaa, Smaa);
++ENUM(StereoMode, Off, SideBySide);
+ ENUM(OotAntiAliasing, Game, NoSharpening);
+ ENUM(NvidiaDlssQuality, Automatic, Native, Quality, Balanced, Performance, UltraPerformance);
+ ENUM(NvidiaDlssPreset, M, NvidiaDefault, E, F, J, K, L);
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 7cf6d06..39d9fdd 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -177,6 +177,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+            tr("Forces to render at a different resolution.\n"
+               "Higher resolutions require more VRAM and bandwidth.\n"
+               "Options lower than 1X can cause artifacts."));
++    INSERT(Settings, stereo_mode, tr("Stereoscopic 3D:"),
++           tr("Outputs the picture for a 3D display.\nSide by Side (half) puts the left eye in the "
++              "left half and the right eye in the right half of the window; set your 3D TV, "
++              "monitor or VR virtual screen to half side-by-side."));
++    INSERT(Settings, stereo_depth, tr("Stereo depth:"),
++           tr("Strength of the 3D effect (eye separation)."));
++    INSERT(Settings, stereo_convergence, tr("Stereo convergence:"),
++           tr("Distance at which the picture sits at the screen plane. Lower pulls the scene out "
++              "of the screen, higher pushes it behind."));
++    INSERT(Settings, stereo_swap_eyes, tr("Swap eyes"),
++           tr("Exchanges the left and right eye (for cross-eyed viewing or displays with the "
++              "opposite order)."));
+     INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"),
+            tr("Bilinear while HDR output is active."));
+     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
+@@ -716,6 +728,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
+                               PAIR(ScalingFilter, SgsrEdge, tr("Snapdragon Game Super Resolution EdgeDir")),
+                               PAIR(ScalingFilter, Fsr3, tr("AMD FidelityFX Super Resolution 1, softer sharpening")),
+                           }});
++    translations->insert({Settings::EnumMetadata<Settings::StereoMode>::Index(),
++                          {
++                              PAIR(StereoMode, Off, tr("Off")),
++                              PAIR(StereoMode, SideBySide, tr("Side by Side (half)")),
++                          }});
+     translations->insert({Settings::EnumMetadata<Settings::AntiAliasing>::Index(),
+                           {
+                               PAIR(AntiAliasing, None, tr("None")),
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index 41372ed..0935f33 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -3,6 +3,7 @@
+ 
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/settings.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "video_core/framebuffer_config.h"
+ #include "video_core/host_shaders/vulkan_present_vert_spv.h"
+@@ -67,6 +68,10 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+         layer_it++;
+     }
+ 
++    // Half side-by-side: the whole composition is drawn once per eye into one half of the frame.
++    // Both eyes show the same image until the renderer provides separate per-eye layers.
++    const bool side_by_side = Settings::values.stereo_mode.GetValue() == Settings::StereoMode::SideBySide;
++
+     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
+         const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
+@@ -92,13 +97,33 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+         BeginRenderPass(cmdbuf, renderpass, host_framebuffer, render_area);
+         cmdbuf.ClearAttachments({clear_attachment}, {clear_rect});
+ 
+-        for (size_t i = 0; i < layer_count; i++) {
+-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipelines[i]);
+-            cmdbuf.PushConstants(graphics_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+-                                 push_constants[i]);
+-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_layout, 0,
+-                                      descriptor_sets[i], {});
+-            cmdbuf.Draw(4, 1, 0, 0);
++        const u32 eye_count = side_by_side ? 2 : 1;
++        const u32 eye_width = side_by_side ? render_area.width / 2 : render_area.width;
++        for (u32 eye = 0; eye < eye_count; eye++) {
++            if (side_by_side) {
++                const VkViewport viewport{
++                    .x = static_cast<float>(eye * eye_width),
++                    .y = 0.0f,
++                    .width = static_cast<float>(eye_width),
++                    .height = static_cast<float>(render_area.height),
++                    .minDepth = 0.0f,
++                    .maxDepth = 1.0f,
++                };
++                const VkRect2D scissor{
++                    .offset = {static_cast<s32>(eye * eye_width), 0},
++                    .extent = {eye_width, render_area.height},
++                };
++                cmdbuf.SetViewport(0, viewport);
++                cmdbuf.SetScissor(0, scissor);
++            }
++            for (size_t i = 0; i < layer_count; i++) {
++                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipelines[i]);
++                cmdbuf.PushConstants(graphics_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
++                                     push_constants[i]);
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
++                                          graphics_pipeline_layout, 0, descriptor_sets[i], {});
++                cmdbuf.Draw(4, 1, 0, 0);
++            }
+         }
+ 
+         cmdbuf.EndRenderPass();
