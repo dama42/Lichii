@@ -1,0 +1,213 @@
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 1657e1c..b0fa442 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -430,6 +430,10 @@ struct Values {
+     SwitchableSetting<bool> stereo_hud_popout{linkage, false, "stereo_hud_popout",
+                                               Category::Renderer, Specialization::Default, true,
+                                               true};
++    // Writes the vertex/fragment shader hashes of stereo draws to the log, for stereo_rules.txt.
++    SwitchableSetting<bool> stereo_debug_log{linkage, false, "stereo_debug_log",
++                                             Category::Renderer, Specialization::Default, true,
++                                             true};
+     SwitchableSetting<bool> stereo_swap_eyes{linkage, false, "stereo_swap_eyes",
+                                              Category::Renderer, Specialization::Default, true,
+                                              true};
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 614a8da..747f584 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -196,6 +196,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+     INSERT(Settings, stereo_hud_popout, tr("Pop out HUD (experimental)"),
+            tr("Moves flat on-screen elements slightly in front of the screen for games with a "
+               "profile. Full-screen effects can shift with them."));
++    INSERT(Settings, stereo_debug_log, tr("Log stereo shaders (debug)"),
++           tr("Writes the shader IDs of stereo draws to the log. Use them in stereo_rules.txt "
++              "(config folder) to skip, scale or flatten the depth of a single effect."));
+     INSERT(Settings, stereo_swap_eyes, tr("Swap eyes"),
+            tr("Exchanges the left and right eye (for cross-eyed viewing or displays with the "
+               "opposite order)."));
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+index 4943274..8e5818d 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+@@ -48,7 +48,9 @@ void ApplyStereoOffset(EmitContext& ctx) {
+         const Id offset{ctx.OpFMul(type, ctx.OpFMul(type, eye, popout), w)};
+         flat = ctx.OpFSub(type, x, offset);
+     }
+-    const Id result{ctx.OpSelect(type, perspective, shifted, flat)};
++    const Id result{ctx.runtime_info.stereo_force_flat
++                        ? flat
++                        : ctx.OpSelect(type, perspective, shifted, flat)};
+     ctx.OpStore(ctx.output_position, ctx.OpCompositeInsert(ctx.F32[4], result, position, 0u));
+ }
+ 
+diff --git a/src/shader_recompiler/runtime_info.h b/src/shader_recompiler/runtime_info.h
+index 3507e11..5a36f2c 100644
+--- a/src/shader_recompiler/runtime_info.h
++++ b/src/shader_recompiler/runtime_info.h
+@@ -108,6 +108,7 @@ struct RuntimeInfo {
+     bool stereo{};
+     float stereo_separation{};
+     float stereo_hud_popout{};
++    bool stereo_force_flat{}; ///< Treat every draw as flat: only the pop-out is applied.
+     float stereo_convergence{1.0f};
+ 
+     TessPrimitive tess_primitive{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 91dd0e9..3d9c174 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -30,6 +30,7 @@
+ #include "common/fs/file_lock.h"
+ #include "common/settings.h"
+ #include "video_core/stereo.h"
++#include "video_core/stereo_rules.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/memory_detect.h"
+@@ -271,10 +272,25 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+             }
+             info.convert_depth_mode = gl_ndc;
+             if (key.state.stereo != 0) {
+-                info.stereo = true;
+-                info.stereo_separation = VideoCore::Stereo::Separation();
+-                info.stereo_hud_popout = VideoCore::Stereo::HudPopout();
+-                info.stereo_convergence = VideoCore::Stereo::Convergence();
++                const u64 vertex_hash = key.unique_hashes[1] != 0 ? key.unique_hashes[1]
++                                                                  : key.unique_hashes[0];
++                const auto rule = VideoCore::Stereo::FindRule(vertex_hash, key.unique_hashes[5]);
++                VideoCore::Stereo::LogShader(vertex_hash, key.unique_hashes[5], rule);
++                using Kind = VideoCore::Stereo::ShaderRule::Kind;
++                if (rule.kind != Kind::Skip) {
++                    info.stereo = true;
++                    info.stereo_separation = VideoCore::Stereo::Separation();
++                    info.stereo_hud_popout = VideoCore::Stereo::HudPopout();
++                    info.stereo_convergence = VideoCore::Stereo::Convergence();
++                    if (rule.kind == Kind::Scale) {
++                        info.stereo_separation *= rule.value;
++                    } else if (rule.kind == Kind::Hud) {
++                        // Flat at the given pop-out, no depth.
++                        info.stereo_separation = 0.0f;
++                        info.stereo_force_flat = true;
++                        info.stereo_hud_popout = rule.value / 100.0f;
++                    }
++                }
+             }
+         }
+         if (key.state.dynamic_vertex_input) {
+diff --git a/src/video_core/stereo_rules.h b/src/video_core/stereo_rules.h
+new file mode 100644
+index 0000000..1a4fdce
+--- /dev/null
++++ b/src/video_core/stereo_rules.h
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <set>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++
++#include "common/common_types.h"
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++
++namespace VideoCore::Stereo {
++
++/// What to do with the draws of one shader, chosen in `stereo_rules.txt` (config directory).
++struct ShaderRule {
++    enum class Kind { Default, Skip, Scale, Hud };
++    Kind kind{Kind::Default};
++    float value{1.0f}; ///< Scale factor, or HUD pop-out in percent.
++};
++
++namespace Detail {
++inline std::mutex rules_mutex;
++inline bool rules_loaded = false;
++inline std::unordered_map<u64, ShaderRule> rules;
++inline std::set<u64> logged;
++
++inline void LoadRules() {
++    rules_loaded = true;
++    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "stereo_rules.txt";
++    std::ifstream file{path};
++    if (!file) {
++        return;
++    }
++    std::string line;
++    while (std::getline(file, line)) {
++        if (const auto hash_comment = line.find('#'); hash_comment != std::string::npos) {
++            line.resize(hash_comment);
++        }
++        std::istringstream words{line};
++        std::string hash_text;
++        std::string kind;
++        if (!(words >> hash_text >> kind)) {
++            continue;
++        }
++        u64 hash{};
++        try {
++            hash = std::stoull(hash_text, nullptr, 16);
++        } catch (...) {
++            continue;
++        }
++        ShaderRule rule;
++        float value{};
++        if (kind == "skip") {
++            rule.kind = ShaderRule::Kind::Skip;
++        } else if (kind == "scale" && (words >> value)) {
++            rule.kind = ShaderRule::Kind::Scale;
++            rule.value = value;
++        } else if (kind == "hud") {
++            rule.kind = ShaderRule::Kind::Hud;
++            rule.value = (words >> value) ? value : 1.0f;
++        } else {
++            LOG_WARNING(Render_Vulkan, "stereo_rules.txt: ignoring '{}'", line);
++            continue;
++        }
++        rules[hash] = rule;
++    }
++    LOG_INFO(Render_Vulkan, "Stereo rules: {} loaded from {}", rules.size(), path.string());
++}
++} // namespace Detail
++
++/// Looks up the rule for a draw by its vertex or fragment shader hash (vertex first).
++[[nodiscard]] inline ShaderRule FindRule(u64 vertex_hash, u64 fragment_hash) {
++    std::scoped_lock lock{Detail::rules_mutex};
++    if (!Detail::rules_loaded) {
++        Detail::LoadRules();
++    }
++    for (const u64 hash : {vertex_hash, fragment_hash}) {
++        if (const auto it = Detail::rules.find(hash); it != Detail::rules.end()) {
++            return it->second;
++        }
++    }
++    return {};
++}
++
++/// With "Log stereo shaders" on, writes each shader pair once so it can be named in the rules.
++inline void LogShader(u64 vertex_hash, u64 fragment_hash, const ShaderRule& rule) {
++    if (!Settings::values.stereo_debug_log.GetValue()) {
++        return;
++    }
++    std::scoped_lock lock{Detail::rules_mutex};
++    if (!Detail::logged.insert(vertex_hash ^ (fragment_hash * 0x9E3779B97F4A7C15ULL)).second) {
++        return;
++    }
++    LOG_INFO(Render_Vulkan, "Stereo shader: vertex={:016x} fragment={:016x} rule={}", vertex_hash,
++             fragment_hash,
++             rule.kind == ShaderRule::Kind::Default ? "default"
++             : rule.kind == ShaderRule::Kind::Skip  ? "skip"
++             : rule.kind == ShaderRule::Kind::Scale ? "scale"
++                                                    : "hud");
++}
++
++} // namespace VideoCore::Stereo
