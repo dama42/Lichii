@@ -1,0 +1,818 @@
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 328dddc..95b6db6 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -417,6 +417,11 @@ struct Values {
+                                                         Specialization::Percentage,
+                                                     true,
+                                                     true};
++    // Experimental: renders both eyes (Vulkan multiview) so the 3D effect has real depth. Read
++    // once when the renderer starts; restart the game after changing it.
++    SwitchableSetting<bool> stereo_geometric{linkage, false, "stereo_geometric",
++                                             Category::Renderer, Specialization::Default, true,
++                                             true};
+     SwitchableSetting<bool> stereo_swap_eyes{linkage, false, "stereo_swap_eyes",
+                                              Category::Renderer, Specialization::Default, true,
+                                              true};
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 39d9fdd..03f8538 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -186,6 +186,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+     INSERT(Settings, stereo_convergence, tr("Stereo convergence:"),
+            tr("Distance at which the picture sits at the screen plane. Lower pulls the scene out "
+               "of the screen, higher pushes it behind."));
++    INSERT(Settings, stereo_geometric, tr("Stereo depth rendering (experimental)"),
++           tr("Renders the game once per eye so objects have real depth. Needs Side by Side, "
++              "Vulkan multiview and a desktop GPU. Takes effect when the game starts; uses "
++              "more video memory and can cause visual glitches."));
+     INSERT(Settings, stereo_swap_eyes, tr("Swap eyes"),
+            tr("Exchanges the left and right eye (for cross-eyed viewing or displays with the "
+               "opposite order)."));
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+index 71ad263..1a95f13 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+@@ -24,6 +24,27 @@ void ConvertDepthMode(EmitContext& ctx) {
+     ctx.OpStore(ctx.output_position, vector);
+ }
+ 
++/// Shifts the clip-space x of a stereo draw by the eye's parallax: zero at w == convergence,
++/// growing with distance, opposite sign per eye (ViewIndex 0 is the left eye). Positions with
++/// w <= 1 come from orthographic projections (HUD, full-screen passes) and stay at the screen.
++void ApplyStereoOffset(EmitContext& ctx) {
++    const Id type{ctx.F32[1]};
++    const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
++    const Id x{ctx.OpCompositeExtract(type, position, 0u)};
++    const Id w{ctx.OpCompositeExtract(type, position, 3u)};
++    const Id view{ctx.OpLoad(ctx.U32[1], ctx.view_index)};
++    const Id right_eye{ctx.OpINotEqual(ctx.U1, view, ctx.u32_zero_value)};
++    const Id eye{
++        ctx.OpSelect(type, right_eye, ctx.Constant(type, 1.0f), ctx.Constant(type, -1.0f))};
++    const Id convergence{ctx.Constant(type, ctx.runtime_info.stereo_convergence)};
++    const Id separation{ctx.Constant(type, ctx.runtime_info.stereo_separation)};
++    const Id parallax{ctx.OpFMul(type, ctx.OpFSub(type, w, convergence), separation)};
++    const Id shifted{ctx.OpFAdd(type, x, ctx.OpFMul(type, eye, parallax))};
++    const Id perspective{ctx.OpFOrdGreaterThan(ctx.U1, w, ctx.Constant(type, 1.0001f))};
++    const Id result{ctx.OpSelect(type, perspective, shifted, x)};
++    ctx.OpStore(ctx.output_position, ctx.OpCompositeInsert(ctx.F32[4], result, position, 0u));
++}
++
+ /// Write screen-linear generic outputs times Position.w (see RuntimeInfo::noperspective_outputs).
+ /// Returns the unscaled values so a geometry shader can restore them after EmitVertex.
+ ScaledOutputs ScaleNoPerspectiveOutputs(EmitContext& ctx) {
+@@ -188,6 +209,9 @@ void EmitEpilogue(EmitContext& ctx) {
+         EmitMeshEpilogue(ctx);
+         return;
+     }
++    if (ctx.stage == Stage::VertexB && ctx.runtime_info.stereo && Sirit::ValidId(ctx.view_index)) {
++        ApplyStereoOffset(ctx);
++    }
+     if (ctx.stage == Stage::VertexB && ctx.runtime_info.convert_depth_mode &&
+         !ctx.profile.support_native_ndc) {
+         ConvertDepthMode(ctx);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 61427c7..f5d2dad 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -2064,6 +2064,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+     } else if (loads[IR::Attribute::BaseInstance]) {
+         base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
+     }
++    if (stage == Stage::VertexB && runtime_info.stereo) {
++        AddExtension("SPV_KHR_multiview");
++        AddCapability(spv::Capability::MultiView);
++        view_index = DefineInput(*this, U32[1], true, spv::BuiltIn::ViewIndex);
++    }
+     if (loads[IR::Attribute::VertexId]) {
+         if (profile.support_vertex_instance_id) {
+             vertex_id = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexId);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index e95ef1d..330202e 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -314,6 +314,7 @@ public:
+     Id subgroup_mask_ge{};
+     Id instance_id{};
+     Id instance_index{};
++    Id view_index{};
+     Id base_instance{};
+     Id vertex_id{};
+     Id vertex_index{};
+diff --git a/src/shader_recompiler/runtime_info.h b/src/shader_recompiler/runtime_info.h
+index f78963f..9d9fee1 100644
+--- a/src/shader_recompiler/runtime_info.h
++++ b/src/shader_recompiler/runtime_info.h
+@@ -104,6 +104,11 @@ struct RuntimeInfo {
+     bool convert_depth_mode{};
+     bool force_early_z{};
+ 
++    /// Vertex stage of a draw in a two-view (stereo) render pass: shifts the position per eye.
++    bool stereo{};
++    float stereo_separation{};
++    float stereo_convergence{1.0f};
++
+     TessPrimitive tess_primitive{};
+     TessSpacing tess_spacing{};
+     bool tess_clockwise{};
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index de4fcba..73a33d1 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -13,12 +13,47 @@
+ #include "common/common_types.h"
+ #include "common/settings.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/stereo.h"
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ #include "video_core/renderer_vulkan/vertex_repack.h"
+ #include "video_core/renderer_vulkan/vk_state_tracker.h"
+ 
+ namespace Vulkan {
+ namespace {
++
++/// True when every bound render target is a plain single-layer 2D image, the only kind that gets
++/// a second (right eye) layer. Mirrors how the texture cache derives those images' types.
++bool StereoRenderTargets(const Maxwell& regs) {
++    bool any = false;
++    for (u32 index = 0; index < regs.rt_control.count && index < Maxwell::NumRenderTargets;
++         ++index) {
++        const auto& rt = regs.rt[index];
++        if (rt.Address() == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
++            continue;
++        }
++        if (rt.tile_mode.is_pitch_linear != 0 ||
++            rt.tile_mode.dim_control == Maxwell::TileMode::DimensionControl::DefineDepthSize ||
++            rt.depth.Value() != 1) {
++            return false;
++        }
++        any = true;
++    }
++    if (regs.zeta_enable != 0 && regs.zeta.Address() != 0) {
++        const auto& zeta = regs.zeta;
++        const u32 layers = regs.zeta_size.dim_control ==
++                                   Maxwell::ZetaSize::DimensionControl::DefineArraySize
++                               ? regs.zeta_size.depth.Value()
++                               : 1;
++        if (zeta.tile_mode.is_pitch_linear != 0 ||
++            zeta.tile_mode.dim_control == Maxwell::TileMode::DimensionControl::DefineDepthSize ||
++            layers != 1) {
++            return false;
++        }
++        any = true;
++    }
++    return any;
++}
++
+ constexpr size_t POINT = 0;
+ constexpr size_t LINE = 1;
+ constexpr size_t POLYGON = 2;
+@@ -192,6 +227,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+     alpha_to_coverage_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1 : 0);
+     alpha_to_one_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_one != 0 ? 1 : 0);
+     app_stage.Assign(maxwell3d.engine_state);
++    stereo.Assign(VideoCore::Stereo::Active() && StereoRenderTargets(regs) ? 1 : 0);
+ 
+     depth_bounds_min = static_cast<u32>(regs.depth_bounds[0]);
+     depth_bounds_max = static_cast<u32>(regs.depth_bounds[1]);
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.h b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+index c64e321..a82144d 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.h
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+@@ -231,6 +231,7 @@ struct FixedPipelineState {
+         BitField<15, 1, u32> alpha_to_coverage_enabled;
+         BitField<16, 1, u32> alpha_to_one_enabled;
+         BitField<17, 3, Tegra::Engines::Maxwell3D::EngineHint> app_stage;
++        BitField<20, 1, u32> stereo; ///< Draws into a two-view (left/right eye) render pass.
+     };
+     std::array<u8, Maxwell::NumRenderTargets> color_formats;
+ 
+diff --git a/src/video_core/renderer_vulkan/present/layer.cpp b/src/video_core/renderer_vulkan/present/layer.cpp
+index aeb637c..1a200b8 100644
+--- a/src/video_core/renderer_vulkan/present/layer.cpp
++++ b/src/video_core/renderer_vulkan/present/layer.cpp
+@@ -89,7 +89,8 @@ Layer::~Layer() {
+ }
+ 
+ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_constants,
+-                          VkDescriptorSet* out_descriptor_set, RasterizerVulkan& rasterizer,
++                          VkDescriptorSet* out_descriptor_set,
++                          VkDescriptorSet* out_descriptor_set_eye1, RasterizerVulkan& rasterizer,
+                           VkSampler sampler, size_t image_index,
+                           const Tegra::FramebufferConfig& framebuffer,
+                           const Layout::FramebufferLayout& layout, const HdrPresent& output) {
+@@ -129,6 +130,12 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+         texture_info ? texture_info->image_view : *raw_image_views[image_index];
+ 
+     const HdrConvertParams convert = MakeHdrConvertParams(framebuffer, output);
++    // Side by side with a right eye image: both eyes are shown as rendered, without the filters
++    // that would have to run once per eye.
++    const bool stereo_pair = texture_info && texture_info->image_view_eye1 != VK_NULL_HANDLE &&
++                             Settings::values.stereo_mode.GetValue() ==
++                                 Settings::StereoMode::SideBySide &&
++                             !hdr_output && !NeedsHdrConvert(convert);
+     if (NeedsHdrConvert(convert)) {
+         if (!hdr_convert || hdr_convert->Extent().width != scaled_width ||
+             hdr_convert->Extent().height != scaled_height) {
+@@ -145,7 +152,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+     const bool already_upscaled = texture_info && texture_info->already_upscaled;
+     // FXAA or SMAA on top of NVIDIA DLSS's image only blurs it.
+     const bool anti_aliased = already_upscaled || (texture_info && texture_info->anti_aliased);
+-    if (!anti_aliased && !hdr_output) {
++    if (!anti_aliased && !hdr_output && !stereo_pair) {
+         if (auto* fxaa = std::get_if<FXAA>(&anti_alias)) {
+             fxaa->Draw(device, scheduler, image_index, &source_image, &source_image_view);
+         } else if (auto* smaa = std::get_if<SMAA>(&anti_alias)) {
+@@ -154,7 +161,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+     }
+ 
+ #ifdef HAS_RESHADE
+-    if (!already_upscaled && post_process.has_value()) {
++    if (!already_upscaled && !stereo_pair && post_process.has_value()) {
+         post_process->Draw(device, scheduler, image_index, &source_image, &source_image_view);
+     }
+ #endif
+@@ -165,7 +172,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+         .height = scaled_height,
+     };
+ 
+-    if (!already_upscaled && !hdr_output) {
++    if (!already_upscaled && !hdr_output && !stereo_pair) {
+         if (auto* fsr = std::get_if<FSR>(&sr_filter)) {
+             source_image_view = fsr->Draw(device, scheduler, image_index, source_image, source_image_view, render_extent, crop_rect);
+             crop_rect = {0, 0, 1, 1};
+@@ -185,17 +192,31 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+     SetMatrixData(device, *out_push_constants, layout);
+     SetVertexData(device, *out_push_constants, layout, crop_rect);
+ 
+-    UpdateDescriptorSet(device, source_image_view, sampler, image_index);
++    if (stereo_pair) {
++        VkImageView left_view = source_image_view;
++        VkImageView right_view = texture_info->image_view_eye1;
++        if (Settings::values.stereo_swap_eyes.GetValue()) {
++            std::swap(left_view, right_view);
++        }
++        UpdateDescriptorSet(device, left_view, sampler, descriptor_sets[image_index]);
++        UpdateDescriptorSet(device, right_view, sampler, descriptor_sets_eye1[image_index]);
++        *out_descriptor_set_eye1 = descriptor_sets_eye1[image_index];
++    } else {
++        UpdateDescriptorSet(device, source_image_view, sampler, descriptor_sets[image_index]);
++        *out_descriptor_set_eye1 = VK_NULL_HANDLE;
++    }
+     *out_descriptor_set = descriptor_sets[image_index];
+ }
+ 
+ void Layer::CreateDescriptorPool(const Device& device) {
+-    descriptor_pool = CreateWrappedDescriptorPool(device, image_count, image_count);
++    // A second set per image holds the right eye of a stereo image.
++    descriptor_pool = CreateWrappedDescriptorPool(device, image_count * 2, image_count * 2);
+ }
+ 
+ void Layer::CreateDescriptorSets(const Device& device, VkDescriptorSetLayout layout) {
+     const std::vector layouts(image_count, layout);
+     descriptor_sets = CreateWrappedDescriptorSets(descriptor_pool, layouts);
++    descriptor_sets_eye1 = CreateWrappedDescriptorSets(descriptor_pool, layouts);
+ }
+ 
+ void Layer::CreateStagingBuffer(const Device& device, const Tegra::FramebufferConfig& framebuffer) {
+@@ -343,7 +364,7 @@ void Layer::SetVertexData(const Device& device, PresentPushConstants& data, cons
+     data.vertices[3] = ScreenRectVertex(x + w, y + h, crop.right, crop.bottom);
+ }
+ 
+-void Layer::UpdateDescriptorSet(const Device& device, VkImageView image_view, VkSampler sampler, size_t image_index) {
++void Layer::UpdateDescriptorSet(const Device& device, VkImageView image_view, VkSampler sampler, VkDescriptorSet set) {
+     const VkDescriptorImageInfo image_info{
+         .sampler = sampler,
+         .imageView = image_view,
+@@ -353,7 +374,7 @@ void Layer::UpdateDescriptorSet(const Device& device, VkImageView image_view, Vk
+     const VkWriteDescriptorSet sampler_write{
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .pNext = nullptr,
+-        .dstSet = descriptor_sets[image_index],
++        .dstSet = set,
+         .dstBinding = 0,
+         .dstArrayElement = 0,
+         .descriptorCount = 1,
+diff --git a/src/video_core/renderer_vulkan/present/layer.h b/src/video_core/renderer_vulkan/present/layer.h
+index ab02040..fe58e51 100644
+--- a/src/video_core/renderer_vulkan/present/layer.h
++++ b/src/video_core/renderer_vulkan/present/layer.h
+@@ -59,7 +59,8 @@ public:
+     /// Prepares layer descriptors and push constants. The layer is converted to the frame's
+     /// encoding (output); an HDR frame bypasses anti-aliasing, post-processing and upscaling.
+     void ConfigureDraw(const Device& device, PresentPushConstants* out_push_constants,
+-                       VkDescriptorSet* out_descriptor_set, RasterizerVulkan& rasterizer,
++                       VkDescriptorSet* out_descriptor_set,
++                       VkDescriptorSet* out_descriptor_set_eye1, RasterizerVulkan& rasterizer,
+                        VkSampler sampler, size_t image_index,
+                        const Tegra::FramebufferConfig& framebuffer,
+                        const Layout::FramebufferLayout& layout, const HdrPresent& output);
+@@ -82,7 +83,7 @@ private:
+ 
+     void SetMatrixData(const Device& device, PresentPushConstants& data, const Layout::FramebufferLayout& layout) const;
+     void SetVertexData(const Device& device, PresentPushConstants& data, const Layout::FramebufferLayout& layout, const Common::Rectangle<f32>& crop) const;
+-    void UpdateDescriptorSet(const Device& device, VkImageView image_view, VkSampler sampler, size_t image_index);
++    void UpdateDescriptorSet(const Device& device, VkImageView image_view, VkSampler sampler, VkDescriptorSet set);
+     void UpdateRawImage(const Tegra::FramebufferConfig& framebuffer, size_t image_index);
+ 
+ private:
+@@ -93,6 +94,7 @@ private:
+     const size_t image_count{};
+     vk::DescriptorPool descriptor_pool{};
+     vk::DescriptorSets descriptor_sets{};
++    vk::DescriptorSets descriptor_sets_eye1{}; ///< Right eye of a stereo image
+ 
+     vk::Buffer buffer{};
+     std::vector<vk::Image> raw_images{};
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index 0935f33..38d183f 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -46,6 +46,7 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+     const size_t layer_count = configs.size();
+     std::vector<PresentPushConstants> push_constants(layer_count);
+     std::vector<VkDescriptorSet> descriptor_sets(layer_count);
++    std::vector<VkDescriptorSet> descriptor_sets_eye1(layer_count, VK_NULL_HANDLE);
+     std::vector<VkPipeline> graphics_pipelines(layer_count);
+ 
+     auto layer_it = layers.begin();
+@@ -63,7 +64,8 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+             break;
+         }
+ 
+-        layer_it->ConfigureDraw(device, &push_constants[i], &descriptor_sets[i], rasterizer, *sampler,
++        layer_it->ConfigureDraw(device, &push_constants[i], &descriptor_sets[i], &descriptor_sets_eye1[i],
++                                rasterizer, *sampler,
+                                 image_index, configs[i], layout, output);
+         layer_it++;
+     }
+@@ -120,8 +122,12 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+                 cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipelines[i]);
+                 cmdbuf.PushConstants(graphics_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                      push_constants[i]);
++                // A layer with a right eye image shows it in the right half.
++                const VkDescriptorSet set =
++                    eye == 1 && descriptor_sets_eye1[i] != VK_NULL_HANDLE ? descriptor_sets_eye1[i]
++                                                                           : descriptor_sets[i];
+                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+-                                          graphics_pipeline_layout, 0, descriptor_sets[i], {});
++                                          graphics_pipeline_layout, 0, set, {});
+                 cmdbuf.Draw(4, 1, 0, 0);
+             }
+         }
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index 572d059..def35d2 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -20,6 +20,7 @@
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/frontend/graphics_context.h"
++#include "video_core/stereo.h"
+ #include "video_core/capture.h"
+ #include "video_core/gpu.h"
+ #include "video_core/nx2_profile.h"
+@@ -155,6 +156,15 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
+     return Device(*instance, physical_device, surface, dld);
+ }
+ 
++namespace {
++void LatchStereo(const Device& device) {
++    VideoCore::Stereo::Latch(device.IsMultiviewSupported() && !device.IsTiler());
++    if (VideoCore::Stereo::Active()) {
++        LOG_INFO(Render_Vulkan, "Stereo depth rendering enabled");
++    }
++}
++} // Anonymous namespace
++
+ RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
+                                Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                Tegra::GPU& gpu_,
+@@ -180,7 +190,8 @@ try
+     // Create surface
+     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
+     , device(CreateDevice(instance, dld, *surface))
+-    , memory_allocator(device)
++    // The stereo settings are read here, before the rasterizer builds anything that depends on them.
++    , memory_allocator((LatchStereo(device), device))
+     , state_tracker()
+     , scheduler(device, state_tracker)
+     , swapchain(PresentationSurface(),
+diff --git a/src/video_core/renderer_vulkan/vk_blit_screen.h b/src/video_core/renderer_vulkan/vk_blit_screen.h
+index 895b380..a90bcd4 100644
+--- a/src/video_core/renderer_vulkan/vk_blit_screen.h
++++ b/src/video_core/renderer_vulkan/vk_blit_screen.h
+@@ -43,6 +43,7 @@ struct Frame;
+ struct FramebufferTextureInfo {
+     VkImage image{};
+     VkImageView image_view{};
++    VkImageView image_view_eye1{}; ///< Right eye of a stereo image, null otherwise.
+     u32 width{};
+     u32 height{};
+     u32 scaled_width{};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 9f19c55..478f4a9 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -185,9 +185,26 @@ RenderPassKey MakeRenderPassKey(const FixedPipelineState& state, const Device& d
+     });
+     key.resolve_color =
+         key.samples != VK_SAMPLE_COUNT_1_BIT && has_color && device.IsTiler();
++    key.stereo = state.stereo != 0;
+     return key;
+ }
+ 
++/// A pipeline built for a two-view render pass can only draw into a two-view framebuffer and the
++/// reverse. They differ when a render target is not a plain image with a right eye layer; that
++/// draw is skipped.
++bool StereoFramebufferMatches(const FixedPipelineState& state, const Framebuffer* framebuffer) {
++    if ((state.stereo != 0) == framebuffer->IsStereo()) {
++        return true;
++    }
++    static std::atomic<u32> reports{0};
++    if (reports.fetch_add(1) < 8) {
++        LOG_WARNING(Render_Vulkan,
++                    "Skipping a draw: its stereo state ({}) differs from its framebuffer's ({})",
++                    state.stereo != 0, framebuffer->IsStereo());
++    }
++    return false;
++}
++
+ size_t NumAttachments(const FixedPipelineState& state) {
+     size_t num{};
+     for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+@@ -1254,6 +1271,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+             scheduler.RequestOutsideRenderPassOperationContext();
+         }
+     }
++    if (!StereoFramebufferMatches(key.state, texture_cache.GetFramebuffer())) {
++        return false;
++    }
+     if (IsBuilt() && (!pipeline || build->Failed())) {
+         return false;
+     }
+@@ -1424,6 +1444,9 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+             scheduler.RequestOutsideRenderPassOperationContext();
+         }
+     }
++    if (!StereoFramebufferMatches(key.state, texture_cache.GetFramebuffer())) {
++        return false;
++    }
+     if (IsBuilt() && (!pipeline || build->Failed())) {
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index c12160d..91888d5 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -29,6 +29,7 @@
+ #include "common/cityhash.h"
+ #include "common/fs/file_lock.h"
+ #include "common/settings.h"
++#include "video_core/stereo.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/memory_detect.h"
+@@ -269,6 +270,11 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+                 }
+             }
+             info.convert_depth_mode = gl_ndc;
++            if (key.state.stereo != 0) {
++                info.stereo = true;
++                info.stereo_separation = VideoCore::Stereo::Separation();
++                info.stereo_convergence = VideoCore::Stereo::Convergence();
++            }
+         }
+         if (key.state.dynamic_vertex_input) {
+             for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3d6b639..19a2b04 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -4042,6 +4042,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
+     FramebufferTextureInfo info{};
+     info.image = image_view->ImageHandle();
+     info.image_view = image_view->Handle(Shader::TextureType::Color2D);
++    info.image_view_eye1 = image_view->Eye1View();
+     info.width = image_view->size.width;
+     info.height = image_view->size.height;
+     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
+@@ -4056,6 +4057,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
+             oot_live_dlss->Composite4k(info.image_view, render_trace_frame);
+             info.image = oot_live_dlss->CompositedImage();
+             info.image_view = oot_live_dlss->CompositedView();
++            info.image_view_eye1 = VK_NULL_HANDLE;
+             info.scaled_width = 3840;
+             info.scaled_height = 2160;
+             info.already_upscaled = true;
+diff --git a/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp b/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
+index 07bc1f2..e67e4e3 100644
+--- a/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
+@@ -238,8 +238,10 @@ VkRenderPass RenderPassCache::Get(const RenderPassKey& key) {
+             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+-            .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
++            .dependencyFlags = static_cast<VkDependencyFlags>(
++                VK_DEPENDENCY_BY_REGION_BIT | (key.stereo ? VK_DEPENDENCY_VIEW_LOCAL_BIT : 0))
+     };
++    constexpr u32 STEREO_VIEW_MASK = 0b11;
+ 
+     if (device->IsKhrCreateRenderPass2Supported()) {
+         boost::container::static_vector<VkAttachmentDescription2, MAX_ATTACHMENTS> descriptions2;
+@@ -288,7 +290,7 @@ VkRenderPass RenderPassCache::Get(const RenderPassKey& key) {
+             .pNext = do_resolve_depth_stencil ? &depth_stencil_resolve : nullptr,
+             .flags = 0,
+             .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+-            .viewMask = 0,
++            .viewMask = key.stereo ? STEREO_VIEW_MASK : 0,
+             .inputAttachmentCount = 0,
+             .pInputAttachments = nullptr,
+             .colorAttachmentCount = num_attachments,
+@@ -320,15 +322,25 @@ VkRenderPass RenderPassCache::Get(const RenderPassKey& key) {
+             .pSubpasses = &subpass2,
+             .dependencyCount = 1,
+             .pDependencies = &dependency2,
+-            .correlatedViewMaskCount = 0,
+-            .pCorrelatedViewMasks = nullptr,
++            .correlatedViewMaskCount = key.stereo ? 1u : 0u,
++            .pCorrelatedViewMasks = key.stereo ? &STEREO_VIEW_MASK : nullptr,
+         });
+         return *pair->second;
+     }
+ 
++    const VkRenderPassMultiviewCreateInfo multiview_info{
++        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
++        .pNext = nullptr,
++        .subpassCount = 1,
++        .pViewMasks = &STEREO_VIEW_MASK,
++        .dependencyCount = 0,
++        .pViewOffsets = nullptr,
++        .correlationMaskCount = 1,
++        .pCorrelationMasks = &STEREO_VIEW_MASK,
++    };
+     pair->second = device->GetLogical().CreateRenderPass({
+         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+-        .pNext = nullptr,
++        .pNext = key.stereo ? &multiview_info : nullptr,
+         .flags = 0,
+         .attachmentCount = static_cast<u32>(descriptions.size()),
+         .pAttachments = descriptions.empty() ? nullptr : descriptions.data(),
+diff --git a/src/video_core/renderer_vulkan/vk_render_pass_cache.h b/src/video_core/renderer_vulkan/vk_render_pass_cache.h
+index 3f4a449..125d4b4 100644
+--- a/src/video_core/renderer_vulkan/vk_render_pass_cache.h
++++ b/src/video_core/renderer_vulkan/vk_render_pass_cache.h
+@@ -26,6 +26,7 @@ struct RenderPassKey {
+     bool depth_stencil_clear;
+     u32 color_discard_mask;
+     bool depth_stencil_discard;
++    bool stereo; ///< Renders two views (left and right eye) with multiview.
+ };
+ 
+ } // namespace Vulkan
+@@ -50,7 +51,8 @@ struct hash<Vulkan::RenderPassKey> {
+                           (static_cast<u64>(key.resolve_color) << 32) |
+                           (static_cast<u64>(key.depth_stencil_clear) << 33) |
+                           (static_cast<u64>(key.resolve_depth_stencil) << 34) |
+-                          (static_cast<u64>(key.depth_stencil_discard) << 35);
++                          (static_cast<u64>(key.depth_stencil_discard) << 35) |
++                          (static_cast<u64>(key.stereo) << 36);
+         size_t seed = 0;
+         Common::HashCombine(seed, formats);
+         Common::HashCombine(seed, state);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index e19cbba..022e344 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -55,6 +55,7 @@
+ #include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "video_core/stereo.h"
+ #include "video_core/textures/decoders.h"
+ 
+ namespace Vulkan {
+@@ -437,6 +438,21 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+ // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
+ // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
+ // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
++/// Plain single-layer 2D images get a second layer (the right eye) while stereo rendering is on.
++/// Keep this in step with StereoRenderTargets in fixed_pipeline_state.cpp.
++[[nodiscard]] bool WantsStereoLayers(const ImageInfo& info) {
++    return VideoCore::Stereo::Active() && info.type == ImageType::e2D &&
++           info.resources.layers == 1 && info.size.depth == 1 &&
++           !IsPixelFormatASTC(info.format) && !IsPixelFormatBCn(info.format);
++}
++
++[[nodiscard]] ImageInfo StereoHostInfo(ImageInfo host_info, const ImageInfo& info) {
++    if (WantsStereoLayers(info)) {
++        host_info.resources.layers = 2;
++    }
++    return host_info;
++}
++
+ [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+     level_offset = 0;
+     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
+@@ -3030,7 +3046,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
+       runtime{&runtime_},
+       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
+-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
++                               StereoHostInfo(TrimmedHostInfo(runtime_.device, info,
++                                                              host_level_offset),
++                                              info),
+                                IsHugeAstcArray(runtime_.device, info) ||
+                                        IsUnevenMipRgba8Astc(runtime_.device, info)
+                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
+@@ -3044,7 +3062,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
+                                true)),
+-      aspect_mask(ImageAspectMask(info.format)) {
++      aspect_mask(ImageAspectMask(info.format)), stereo_layers(WantsStereoLayers(info)) {
+     if (OutOfMemory()) {
+         return;
+     }
+@@ -4493,6 +4511,22 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         create(TextureType::Color2D, 1);
+         create(TextureType::ColorArray2D, std::nullopt);
+         render_target = Handle(Shader::TextureType::ColorArray2D);
++        if (image.HasStereoLayers() && create_info.subresourceRange.baseArrayLayer == 0 &&
++            create_info.subresourceRange.layerCount == 1) {
++            if (info.IsRenderTarget()) {
++                // Both eyes render into layers 0 and 1 of one array view (multiview).
++                VkImageViewCreateInfo stereo_info{create_info};
++                stereo_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++                stereo_info.subresourceRange.layerCount = 2;
++                stereo_render_view = device->GetLogical().CreateImageView(stereo_info);
++                render_target = *stereo_render_view;
++            }
++            VkImageViewCreateInfo eye_info{create_info};
++            eye_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++            eye_info.subresourceRange.baseArrayLayer = 1;
++            eye_info.subresourceRange.layerCount = 1;
++            eye1_view = device->GetLogical().CreateImageView(eye_info);
++        }
+         // Native shaders can sample six layers of a 2D array as a cube (point-light shadows).
+         // Adapted from Duck912/eden-fefw a1b23ac3.
+         if (info.type == VideoCommon::ImageViewType::e2DArray && info.range.extent.layers >= 6 &&
+@@ -5036,6 +5070,20 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
+     if (num_layers == (std::numeric_limits<s32>::max)()) {
+         num_layers = 1;
+     }
++    // Stereo: every attachment is a two-layer view, rendered with one view per eye. Multiview
++    // draws both layers from a framebuffer that is declared with a single layer.
++    bool stereo = VideoCore::Stereo::Active() && !runtime.device.IsTiler() && num_images > 0;
++    for (const ImageView* const color_buffer : color_buffers) {
++        stereo = stereo && (!color_buffer || color_buffer->IsStereoRender());
++    }
++    stereo = stereo && (!depth_buffer || depth_buffer->IsStereoRender());
++    if (stereo) {
++        num_layers = 1;
++        for (u32 index = 0; index < num_images; ++index) {
++            image_ranges[index].layerCount = 2;
++        }
++    }
++    renderpass_key.stereo = stereo;
+     layers = static_cast<u32>((std::max)(num_layers, 1));
+     LOG_DEBUG(Render_Vulkan,
+               "Framebuffer layers: layers={}, color0_layers={}, depth_layers={}, attachments={}",
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 1cb401a..9e4225c 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -394,6 +394,11 @@ public:
+         return render_pass_key;
+     }
+ 
++    /// True when this framebuffer renders both eyes (multiview, two-layer attachments).
++    [[nodiscard]] bool IsStereo() const noexcept {
++        return render_pass_key.stereo;
++    }
++
+     [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_clear_mask, bool depth_stencil_clear,
+                                                  u32 color_discard_mask,
+                                                  bool depth_stencil_discard) const;
+@@ -499,6 +504,11 @@ public:
+     u32 HostMipLevels() const noexcept;
+ 
+     /// No memory was left to make it: the texture cache drops it instead of using it.
++    /// True when the host image has a second layer for the right eye.
++    [[nodiscard]] bool HasStereoLayers() const noexcept {
++        return stereo_layers;
++    }
++
+     [[nodiscard]] bool OutOfMemory() const noexcept {
+         return !original_image && info.type != VideoCommon::ImageType::Buffer;
+     }
+@@ -702,6 +712,7 @@ private:
+     std::vector<vk::ImageView> storage_image_views;
+     std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
+     VkImageAspectFlags aspect_mask = 0;
++    bool stereo_layers = false;
+     bool initialized = false;
+ 
+     std::optional<Framebuffer> scale_framebuffer;
+@@ -754,6 +765,16 @@ public:
+         return render_target;
+     }
+ 
++    /// True when RenderTarget() is a two-layer view that both eyes render into.
++    [[nodiscard]] bool IsStereoRender() const noexcept {
++        return static_cast<bool>(stereo_render_view);
++    }
++
++    /// 2D view of the right eye's layer, or null when the image has no right eye.
++    [[nodiscard]] VkImageView Eye1View() const noexcept {
++        return *eye1_view;
++    }
++
+     [[nodiscard]] VkSampleCountFlagBits Samples() const noexcept {
+         return samples;
+     }
+@@ -804,6 +825,8 @@ private:
+     vk::ImageView depth_view;
+     vk::ImageView stencil_view;
+     vk::ImageView color_view;
++    vk::ImageView stereo_render_view;
++    vk::ImageView eye1_view;
+     vk::Image null_image;
+     VkImage image_handle = VK_NULL_HANDLE;
+     VkImageView render_target = VK_NULL_HANDLE;
+diff --git a/src/video_core/stereo.h b/src/video_core/stereo.h
+new file mode 100644
+index 0000000..06c813c
+--- /dev/null
++++ b/src/video_core/stereo.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cmath>
++
++#include "common/common_types.h"
++#include "common/settings.h"
++
++namespace VideoCore::Stereo {
++
++namespace Detail {
++inline std::atomic<bool> active{false};
++inline std::atomic<f32> separation{0.0f};
++inline std::atomic<f32> convergence{1.0f};
++} // namespace Detail
++
++/// Reads the stereo settings once, when the renderer starts. Every render pass, image and shader
++/// built afterwards uses this snapshot, so changing the settings needs a restart of the game.
++inline void Latch(bool multiview_supported) {
++    const bool wanted = Settings::values.stereo_mode.GetValue() == Settings::StereoMode::SideBySide &&
++                        Settings::values.stereo_geometric.GetValue();
++    const f32 depth = static_cast<f32>(Settings::values.stereo_depth.GetValue()) / 100.0f;
++    const f32 convergence = static_cast<f32>(Settings::values.stereo_convergence.GetValue()) / 100.0f;
++    // Clip-space x shift per unit of (w - convergence): 3% of the half-width at depth 100%.
++    Detail::separation.store(0.03f * depth);
++    // Distance (in clip-space w) of the plane that has no parallax: 0.5 to 500.
++    Detail::convergence.store(0.5f * std::pow(1000.0f, convergence));
++    Detail::active.store(wanted && multiview_supported);
++}
++
++[[nodiscard]] inline bool Active() {
++    return Detail::active.load(std::memory_order_relaxed);
++}
++
++[[nodiscard]] inline f32 Separation() {
++    return Detail::separation.load(std::memory_order_relaxed);
++}
++
++[[nodiscard]] inline f32 Convergence() {
++    return Detail::convergence.load(std::memory_order_relaxed);
++}
++
++} // namespace VideoCore::Stereo
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 08bce26..965f5c3 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -33,6 +33,7 @@ VK_DEFINE_HANDLE(VmaPool)
+ // If the Vulkan version is lower than the required version, the named extension is required.
+ #define FOR_EACH_VK_FEATURE_1_1(FEATURE)                                                           \
+     FEATURE(KHR, 16BitStorage, 16BIT_STORAGE, bit16_storage)                                       \
++    FEATURE(KHR, Multiview, MULTIVIEW, multiview)                                                  \
+     FEATURE(KHR, ShaderAtomicInt64, SHADER_ATOMIC_INT64, shader_atomic_int64)                      \
+     FEATURE(KHR, ShaderDrawParameters, SHADER_DRAW_PARAMETERS, shader_draw_parameters)             \
+     FEATURE(KHR, ShaderFloat16Int8, SHADER_FLOAT16_INT8, shader_float16_int8)                      \
+@@ -1202,6 +1203,11 @@ FN_MAX_LIMIT_LIST
+         return features2.features.multiViewport;
+     }
+ 
++    /// Returns true if render passes can render several views at once (Vulkan 1.1 multiview).
++    bool IsMultiviewSupported() const {
++        return features.multiview.multiview != VK_FALSE;
++    }
++
+     /// Returns true if the device supports VK_KHR_maintenance1.
+     bool IsKhrMaintenance1Supported() const {
+         return extensions.maintenance1;
