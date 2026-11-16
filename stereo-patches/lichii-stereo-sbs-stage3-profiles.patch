@@ -1,0 +1,252 @@
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 95b6db6..1657e1c 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -422,6 +422,14 @@ struct Values {
+     SwitchableSetting<bool> stereo_geometric{linkage, false, "stereo_geometric",
+                                              Category::Renderer, Specialization::Default, true,
+                                              true};
++    // Use the built-in per-game tuning (separation/convergence) when the game has one.
++    SwitchableSetting<bool> stereo_use_profiles{linkage, true, "stereo_use_profiles",
++                                                Category::Renderer, Specialization::Default,
++                                                true, true};
++    // Shift flat HUD draws towards the viewer by the profile's pop-out amount (experimental).
++    SwitchableSetting<bool> stereo_hud_popout{linkage, false, "stereo_hud_popout",
++                                              Category::Renderer, Specialization::Default, true,
++                                              true};
+     SwitchableSetting<bool> stereo_swap_eyes{linkage, false, "stereo_swap_eyes",
+                                              Category::Renderer, Specialization::Default, true,
+                                              true};
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 03f8538..614a8da 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -190,6 +190,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+            tr("Renders the game once per eye so objects have real depth. Needs Side by Side, "
+               "Vulkan multiview and a desktop GPU. Takes effect when the game starts; uses "
+               "more video memory and can cause visual glitches."));
++    INSERT(Settings, stereo_use_profiles, tr("Use built-in game profiles"),
++           tr("Uses tuned depth and convergence values for games that have a profile. The depth "
++              "and convergence sliders then adjust the profile; at 100% and 50 they equal it."));
++    INSERT(Settings, stereo_hud_popout, tr("Pop out HUD (experimental)"),
++           tr("Moves flat on-screen elements slightly in front of the screen for games with a "
++              "profile. Full-screen effects can shift with them."));
+     INSERT(Settings, stereo_swap_eyes, tr("Swap eyes"),
+            tr("Exchanges the left and right eye (for cross-eyed viewing or displays with the "
+               "opposite order)."));
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+index 1a95f13..4943274 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+@@ -41,7 +41,14 @@ void ApplyStereoOffset(EmitContext& ctx) {
+     const Id parallax{ctx.OpFMul(type, ctx.OpFSub(type, w, convergence), separation)};
+     const Id shifted{ctx.OpFAdd(type, x, ctx.OpFMul(type, eye, parallax))};
+     const Id perspective{ctx.OpFOrdGreaterThan(ctx.U1, w, ctx.Constant(type, 1.0001f))};
+-    const Id result{ctx.OpSelect(type, perspective, shifted, x)};
++    Id flat{x};
++    if (ctx.runtime_info.stereo_hud_popout != 0.0f) {
++        // Flat draws move opposite to the parallax sign, i.e. in front of the screen.
++        const Id popout{ctx.Constant(type, ctx.runtime_info.stereo_hud_popout)};
++        const Id offset{ctx.OpFMul(type, ctx.OpFMul(type, eye, popout), w)};
++        flat = ctx.OpFSub(type, x, offset);
++    }
++    const Id result{ctx.OpSelect(type, perspective, shifted, flat)};
+     ctx.OpStore(ctx.output_position, ctx.OpCompositeInsert(ctx.F32[4], result, position, 0u));
+ }
+ 
+diff --git a/src/shader_recompiler/runtime_info.h b/src/shader_recompiler/runtime_info.h
+index 9d9fee1..3507e11 100644
+--- a/src/shader_recompiler/runtime_info.h
++++ b/src/shader_recompiler/runtime_info.h
+@@ -107,6 +107,7 @@ struct RuntimeInfo {
+     /// Vertex stage of a draw in a two-view (stereo) render pass: shifts the position per eye.
+     bool stereo{};
+     float stereo_separation{};
++    float stereo_hud_popout{};
+     float stereo_convergence{1.0f};
+ 
+     TessPrimitive tess_primitive{};
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 6406e09..b64ee2d 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -43,6 +43,7 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/stereo.h"
+ #include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_backx.h"
+ #include "video_core/nx2_profile.h"
+@@ -89,6 +90,7 @@ struct GPU::Impl {
+     }
+ 
+     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
++        VideoCore::Stereo::SelectProfile(program_id);
+         to_init.Init(system, program_id);
+         to_init.BindRasterizer(renderer->ReadRasterizer());
+         renderer->ReadRasterizer()->InitializeChannel(to_init);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 91888d5..91dd0e9 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -273,6 +273,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+             if (key.state.stereo != 0) {
+                 info.stereo = true;
+                 info.stereo_separation = VideoCore::Stereo::Separation();
++                info.stereo_hud_popout = VideoCore::Stereo::HudPopout();
+                 info.stereo_convergence = VideoCore::Stereo::Convergence();
+             }
+         }
+diff --git a/src/video_core/stereo.h b/src/video_core/stereo.h
+index 06c813c..9d87b8b 100644
+--- a/src/video_core/stereo.h
++++ b/src/video_core/stereo.h
+@@ -2,32 +2,74 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cmath>
+ 
+ #include "common/common_types.h"
++#include "common/logging.h"
+ #include "common/settings.h"
++#include "video_core/stereo_profiles.h"
+ 
+ namespace VideoCore::Stereo {
+ 
+ namespace Detail {
++inline std::atomic<bool> supported{false};
++inline std::atomic<bool> wanted{false};
+ inline std::atomic<bool> active{false};
+ inline std::atomic<f32> separation{0.0f};
+ inline std::atomic<f32> convergence{1.0f};
++inline std::atomic<f32> hud_popout{0.0f};
++// Without a game profile: x shift per unit of (w - convergence) at depth 100%, and the
++// convergence distance at the middle of the convergence slider.
++constexpr f32 DEFAULT_SEPARATION = 0.03f;
++constexpr f32 DEFAULT_CONVERGENCE = 15.811388f; // 0.5 * 1000^0.5
++inline std::atomic<f32> base_separation{DEFAULT_SEPARATION};
++inline std::atomic<f32> base_convergence{DEFAULT_CONVERGENCE};
++inline std::atomic<f32> base_hud_popout{0.0f};
++
++inline void Recompute() {
++    const f32 depth = static_cast<f32>(Settings::values.stereo_depth.GetValue()) / 100.0f;
++    // The slider at 50 keeps the base convergence; every 100 steps scale it by 1000.
++    const f32 slider =
++        static_cast<f32>(Settings::values.stereo_convergence.GetValue() - 50) / 100.0f;
++    separation.store(base_separation.load() * depth);
++    convergence.store(base_convergence.load() * std::pow(1000.0f, slider));
++    hud_popout.store(Settings::values.stereo_hud_popout.GetValue() ? base_hud_popout.load()
++                                                                   : 0.0f);
++    active.store(wanted.load() && supported.load());
++}
+ } // namespace Detail
+ 
+ /// Reads the stereo settings once, when the renderer starts. Every render pass, image and shader
+ /// built afterwards uses this snapshot, so changing the settings needs a restart of the game.
+ inline void Latch(bool multiview_supported) {
+-    const bool wanted = Settings::values.stereo_mode.GetValue() == Settings::StereoMode::SideBySide &&
+-                        Settings::values.stereo_geometric.GetValue();
+-    const f32 depth = static_cast<f32>(Settings::values.stereo_depth.GetValue()) / 100.0f;
+-    const f32 convergence = static_cast<f32>(Settings::values.stereo_convergence.GetValue()) / 100.0f;
+-    // Clip-space x shift per unit of (w - convergence): 3% of the half-width at depth 100%.
+-    Detail::separation.store(0.03f * depth);
+-    // Distance (in clip-space w) of the plane that has no parallax: 0.5 to 500.
+-    Detail::convergence.store(0.5f * std::pow(1000.0f, convergence));
+-    Detail::active.store(wanted && multiview_supported);
++    Detail::wanted.store(Settings::values.stereo_mode.GetValue() ==
++                             Settings::StereoMode::SideBySide &&
++                         Settings::values.stereo_geometric.GetValue());
++    Detail::supported.store(multiview_supported);
++    Detail::base_separation.store(Detail::DEFAULT_SEPARATION);
++    Detail::base_convergence.store(Detail::DEFAULT_CONVERGENCE);
++    Detail::base_hud_popout.store(0.0f);
++    Detail::Recompute();
++}
++
++/// Called when a GPU channel starts for a program. A game with a built-in profile replaces the
++/// generic separation and convergence; the depth and convergence sliders then adjust the profile.
++inline void SelectProfile(u64 program_id) {
++    if (!Detail::wanted.load() || !Settings::values.stereo_use_profiles.GetValue()) {
++        return;
++    }
++    const auto profile = FindGameProfile(program_id);
++    if (!profile) {
++        return;
++    }
++    Detail::base_separation.store(profile->separation);
++    Detail::base_convergence.store(profile->convergence);
++    Detail::base_hud_popout.store((std::min)(profile->hud_popout_percent, 5.0f) / 100.0f);
++    Detail::Recompute();
++    LOG_INFO(Render_Vulkan, "Stereo profile for {:016X}: separation={}, convergence={}",
++             program_id, profile->separation, profile->convergence);
+ }
+ 
+ [[nodiscard]] inline bool Active() {
+@@ -42,4 +84,9 @@ inline void Latch(bool multiview_supported) {
+     return Detail::convergence.load(std::memory_order_relaxed);
+ }
+ 
++/// Shift (clip x per unit w) of flat HUD draws, 0 when disabled.
++[[nodiscard]] inline f32 HudPopout() {
++    return Detail::hud_popout.load(std::memory_order_relaxed);
++}
++
+ } // namespace VideoCore::Stereo
+diff --git a/src/video_core/stereo_profiles.h b/src/video_core/stereo_profiles.h
+new file mode 100644
+index 0000000..a91427b
+--- /dev/null
++++ b/src/video_core/stereo_profiles.h
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <optional>
++
++#include "common/common_types.h"
++
++namespace VideoCore::Stereo {
++
++/// Per-game tuning taken from the Ryujinx Stereo fork's profiles. That fork applies the same
++/// parallax as Lichii (clip x += eye * separation * (w - convergence)), so the numbers carry over.
++/// Only the numbers are used; the fork's OpenGL-specific shader rewrites are not part of this.
++struct GameProfile {
++    u64 title_id; ///< Base title id (low 13 bits cleared).
++    f32 separation;
++    f32 convergence;
++    f32 hud_popout_percent; ///< Shift of flat (HUD) draws, in percent of the half width.
++};
++
++inline constexpr std::array<GameProfile, 13> GAME_PROFILES{{
++    {0x0100000000010000, 0.016256448f, 1900.0f, 1.2f},  // Super Mario Odyssey
++    {0x010015100b514000, 0.00168f, 625.0f, 0.0f},       // Super Mario Bros. Wonder
++    {0x0100152000022000, 0.00744f, 300.0f, 0.8f},       // Mario Kart 8 Deluxe
++    {0x010028600ebda000, 0.012f, 2250.0f, 2.0f},        // Super Mario 3D World + Bowser's Fury
++    {0x01004d300c5ae000, 0.00672f, 50.0f, 0.5f},        // Kirby and the Forgotten Land
++    {0x01006a800016e000, 0.01848f, 200.0f, 2.0f},       // (title id only, from the fork)
++    {0x01006bb00c6f0000, 0.003893984f, 125.0f, 4.0f},   // The Legend of Zelda: Link's Awakening
++    {0x01007ef00011e000, 0.0113568f, 12.0f, 0.0f},      // The Legend of Zelda: Breath of the Wild
++    {0x010093801237c000, 0.005014891f, 3000.0f, 0.3f},  // Metroid Dread
++    {0x01009bf0072d4000, 0.0156f, 2800.0f, 0.0f},       // (title id only, from the fork)
++    {0x0100c1f0051b6000, 0.00072f, 425.0f, 2.0f},       // (title id only, from the fork)
++    {0x0100ea80032ea000, 0.024f, 1800.0f, 0.5f},        // (title id only, from the fork)
++    {0x0100f2c0115b6000, 0.01070784f, 12.0f, 2.0f},     // The Legend of Zelda: Tears of the Kingdom
++}};
++
++[[nodiscard]] constexpr std::optional<GameProfile> FindGameProfile(u64 program_id) {
++    const u64 base = program_id & ~u64{0x1FFF};
++    for (const GameProfile& profile : GAME_PROFILES) {
++        if (profile.title_id == base) {
++            return profile;
++        }
++    }
++    return std::nullopt;
++}
++
++} // namespace VideoCore::Stereo
